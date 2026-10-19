@@ -1,0 +1,101 @@
+// Headless self test for the nvgt_steamaudio plugin: writes selftest_result.txt next to the script and exits.
+#pragma plugin nvgt_steamaudio
+
+string result;
+int failures = 0;
+void check(bool ok, const string&in what) {
+	result += (ok ? "OK   " : "FAIL ") + what + "\r\n";
+	if (!ok) failures++;
+}
+string f(float v) { return "" + round(v, 3); }
+
+steam_audio_scene@ room(bool with_wall) {
+	steam_audio_scene scene;
+	int concrete = scene.add_material(0.05, 0.07, 0.08, 0.05, 0.015, 0.002, 0.001);
+	int wood = scene.add_material(0.11, 0.07, 0.06, 0.05, 0.07, 0.014, 0.005);
+	// a closed 10 x 10 x 4 m room
+	scene.add_box(-0.5, -0.5, -0.5, 10.5, 0, 4.5, concrete);
+	scene.add_box(-0.5, 10, -0.5, 10.5, 10.5, 4.5, concrete);
+	scene.add_box(-0.5, 0, -0.5, 0, 10, 4.5, concrete);
+	scene.add_box(10, 0, -0.5, 10.5, 10, 4.5, concrete);
+	scene.add_box(0, 0, -0.5, 10, 10, 0, concrete);
+	scene.add_box(0, 0, 4, 10, 10, 4.5, concrete);
+	if (with_wall) scene.add_box(4.9, 0, 0, 5.1, 6, 4, wood); // a wooden wall between x 4.9 and 5.1, y 0-6
+	scene.commit();
+	return scene;
+}
+
+void main() {
+	check(steam_audio_get_available(), "context available");
+	steam_audio_scene@ scene = room(true);
+	check(scene.committed, "scene committed, triangles=" + scene.triangle_count);
+
+	steam_audio_simulator sim(scene);
+	check(sim.valid, "direct simulator valid");
+	sim.set_listener(2, 2, 1.5);
+	steam_audio_source@ behind = sim.add_source();
+	behind.set_position(8, 2, 1.5); // behind the wooden wall
+	steam_audio_source@ clear = sim.add_source();
+	clear.set_position(8, 8, 1.5);
+	check(sim.run_direct(), "run_direct");
+	check(behind.occlusion < 0.5, "behind wall: occlusion=" + f(behind.occlusion) + " transmission=" + f(behind.get_transmission(STEAM_AUDIO_BAND_LOW)) + "/" + f(behind.get_transmission(STEAM_AUDIO_BAND_MID)) + "/" + f(behind.get_transmission(STEAM_AUDIO_BAND_HIGH)));
+	check(behind.get_transmission(STEAM_AUDIO_BAND_LOW) > behind.get_transmission(STEAM_AUDIO_BAND_HIGH), "wood lets more low than high frequency through");
+	check(clear.occlusion < 0.5, "(2,2) -> (8,8) crosses the wall too: occlusion=" + f(clear.occlusion));
+	sim.set_listener(2, 8, 1.5); // the wall ends at y 6, so y 8 is open
+	check(sim.run_direct(), "run_direct, new listener");
+	check(clear.occlusion > 0.5, "line of sight above the wall: occlusion=" + f(clear.occlusion));
+	sim.set_listener(2, 2, 1.5);
+
+	// rebuild the same scene object without the wall: the simulator follows the new commit by itself
+	scene.clear();
+	scene.add_box(-0.5, -0.5, -0.5, 10.5, 0, 4.5, 0);
+	scene.commit();
+	check(sim.run_direct(), "run_direct after rebuild");
+	check(behind.occlusion > 0.5, "wall removed: occlusion=" + f(behind.occlusion));
+	behind.remove();
+	check(!behind.attached, "source removed");
+	check(sim.run_direct(), "run_direct with a removed source");
+	@behind = null;
+
+	// parametric reverb time in the closed room
+	steam_audio_scene@ closed = room(false);
+	steam_audio_simulator param(closed, STEAM_AUDIO_REFLECTIONS_PARAMETRIC);
+	param.set_listener(5, 5, 1.5);
+	steam_audio_source@ probe = param.add_source();
+	probe.set_position(5, 5, 1.5);
+	check(param.run_reflections(), "run_reflections (parametric)");
+	check(probe.has_reflections and probe.get_reverb_time(STEAM_AUDIO_BAND_MID) > 0.1, "reverb time in a closed concrete room: " + f(probe.get_reverb_time(STEAM_AUDIO_BAND_LOW)) + "/" + f(probe.get_reverb_time(STEAM_AUDIO_BAND_MID)) + "/" + f(probe.get_reverb_time(STEAM_AUDIO_BAND_HIGH)) + " s");
+
+	// convolution (hybrid) reverb node with the background thread
+	steam_audio_simulator hybrid(closed, STEAM_AUDIO_REFLECTIONS_HYBRID, 4);
+	hybrid.set_listener(2, 2, 1.5);
+	steam_audio_source@ voice = hybrid.add_source();
+	voice.set_position(5, 5, 1.5);
+	check(hybrid.start_reflection_thread(200), "reflection thread started");
+	steam_audio_reverb_node@ node = steam_audio_reverb_node_create();
+	check(node !is null, "reverb node created");
+	check(!node.set_source(probe), "set_source rejects a parametric source");
+	check(node.set_source(voice), "set_source(hybrid source)");
+	node.wet = 0.5;
+	check(abs(node.wet - 0.5) < 0.001, "wet property");
+	tone_synth ts;
+	ts.note_ms("C4", 150);
+	ts.rest_ms(800);
+	sound@ s = ts.write_wave_sound();
+	check(s !is null and s.effects_chain.add_node(node), "node added to a sound");
+	s.volume = -40;
+	s.play();
+	wait(1500);
+	check(voice.has_reflections, "hybrid source got a reflection simulation");
+	// rebuilding the scene must not stop the background thread: it rebinds the new scene by itself
+	uint runs = hybrid.reflection_runs;
+	closed.commit();
+	wait(800);
+	check(hybrid.reflection_runs > runs, "background thread keeps running after a scene rebuild (" + runs + " -> " + hybrid.reflection_runs + ")");
+	check(node.set_source(null), "set_source(null)");
+	hybrid.stop_reflection_thread();
+	check(!hybrid.reflection_thread_running, "reflection thread stopped");
+	result += "failures: " + failures + "\r\n";
+	file_put_contents("selftest_result.txt", result);
+	exit(failures == 0 ? 0 : 1);
+}
