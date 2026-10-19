@@ -55,3 +55,7 @@ Coordinates are plain numbers (x, y, z, z is up) rather than NVGT's `vector`, so
 - The reverb node reads the simulation results on the audio thread without waiting for a running simulation (the same model as Steam Audio's FMOD integration). Until the first reflection simulation of its source finished, it passes the sound through unchanged.
 - The reverb node expects stereo input at 44100 Hz with blocks of up to 4096 frames (NVGT's default engine).
 - NVGT does not notify plugins when a node is destroyed: call `set_source(null)` before dropping a node, otherwise it keeps its source alive.
+
+## License
+
+zlib (see `LICENSE`), the same as NVGT.
